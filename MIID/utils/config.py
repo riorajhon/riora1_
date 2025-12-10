@@ -136,6 +136,14 @@ def add_args(cls, parser):
 def add_miner_args(cls, parser):
     """Add miner specific arguments to the parser."""
 
+    # Override default axon port to 8081 for this project
+    parser.add_argument(
+        "--axon.port",
+        type=int,
+        help="The local port this axon endpoint is served on. i.e. 8081",
+        default=8081,
+    )
+
     parser.add_argument(
         "--neuron.name",
         type=str,
@@ -217,6 +225,14 @@ def add_miner_args(cls, parser):
 
 def add_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""
+
+    # Override default axon port to 8081 for this project
+    parser.add_argument(
+        "--axon.port",
+        type=int,
+        help="The local port this axon endpoint is served on. i.e. 8081",
+        default=8081,
+    )
 
     parser.add_argument(
         "--neuron.name",
@@ -486,7 +502,6 @@ def config(cls):
     bt.Axon.add_args(parser)
     cls.add_args(parser)
     
-    # Override default axon port to 8081 for this project
-    parser.set_defaults(axon__port=8081)
+
     
     return bt.Config(parser)
