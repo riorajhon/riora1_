@@ -485,4 +485,8 @@ def config(cls):
     bt.logging.add_args(parser)
     bt.Axon.add_args(parser)
     cls.add_args(parser)
+    
+    # Override default axon port to 8081 for this project
+    parser.set_defaults(axon__port=8081)
+    
     return bt.Config(parser)

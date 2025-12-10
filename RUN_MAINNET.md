@@ -77,8 +77,8 @@ python neurons/miner.py \
    - Set as environment variable: `export GEMINI_API_KEY=your_key`
    - Or pass via config: `--neuron.gemini_api_key your_key`
 
-4. **Port 8091 Open**
-   - Ensure firewall allows inbound connections on port 8091
+4. **Port 8081 Open**
+   - Ensure firewall allows inbound connections on port 8081
 
 ## 🔧 Configuration Options
 
@@ -106,8 +106,8 @@ export GEMINI_API_KEY=YOUR_API_KEY
 ### Port Configuration
 
 ```bash
-# Default port 8091
---axon.port 8091
+# Default port 8081 (project default)
+--axon.port 8081
 
 # Custom port
 --axon.port 8092
@@ -152,11 +152,11 @@ btcli wallet balance \
 
 ### Check if Port is Open
 ```bash
-# Check if port 8091 is in use
-lsof -i :8091
+# Check if port 8081 is in use
+lsof -i :8081
 
 # Or test from another machine
-telnet YOUR_IP 8091
+telnet YOUR_IP 8081
 ```
 
 ### View Logs
@@ -173,7 +173,7 @@ screen -r miner_mainnet
 1. **Miner Starts**
    - Connects to Bittensor mainnet (archive)
    - Registers on subnet 54
-   - Opens port 8091 for validator connections
+   - Opens port 8081 for validator connections
    - Logs: "MINER: Using Gemini generator"
 
 2. **Receives Request**

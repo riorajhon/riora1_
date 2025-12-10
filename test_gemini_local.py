@@ -125,7 +125,7 @@ async def test_miner_forward_function(api_key: str, model_name: str = "gemini-2.
                 chain_endpoint = "mock"
             
             class axon:
-                port = 8091
+                port = 8081
             
             netuid = 1
             mock = True

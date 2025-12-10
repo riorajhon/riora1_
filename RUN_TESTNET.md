@@ -26,8 +26,8 @@ Before running, you need:
    ```
 
 3. **Network Setup**
-   - Port 8091 must be open (for validator communication)
-   - Ensure firewall allows inbound connections on port 8091
+   - Port 8081 must be open (for validator communication)
+   - Ensure firewall allows inbound connections on port 8081
 
 ## 🚀 Run on Testnet
 
@@ -88,7 +88,7 @@ python neurons/miner.py \
 1. **Miner Starts**
    - Connects to Bittensor testnet (finney)
    - Registers on subnet 54
-   - Opens port 8091 for validator connections
+   - Opens port 8081 for validator connections
    - Logs: "MINER: Using variation_generator_clean.py (NO Ollama/Gemini)"
 
 2. **Receives Request**
@@ -120,8 +120,8 @@ Request completed in X.XXs
 
 ### Port Already in Use
 ```bash
-# Check if port 8091 is in use
-lsof -i :8091
+# Check if port 8081 is in use
+lsof -i :8081
 
 # Or use different port
 --axon.port 8092
