@@ -41,7 +41,7 @@ async def test_miner_gemini():
         ])
         
         config = Miner.config()
-        config.merge(bt.config(parser))
+        config.merge(bt.Config(parser))
         
         # Override with our args
         config.mock = True
