@@ -4,13 +4,13 @@ __pycache__/
 *$py.class
 bt_subnet_venv/
 
-*venv/
-.env/
-*.venv/
-ENV/
-virtualenv/
-*env*/
-*.env
+# *venv/
+# .env/
+# *.venv/
+# ENV/
+# virtualenv/
+# *env*/
+# *.env
 
 # Python bytecode
 __pycache__/
@@ -29,7 +29,7 @@ build/
 *.log
 
 # Local configuration
-.env
+
 .local
 
 # IDE specific files
@@ -154,7 +154,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-.env
+
 .venv
 env/
 venv/
