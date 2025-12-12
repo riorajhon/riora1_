@@ -183,7 +183,7 @@ def test_full_generation():
         variations = generate_variations_with_gemini(
             synapse,
             gemini_api_key=api_key,
-            gemini_model="gemini-2.0-flash-exp"
+            gemini_model="gemini-2.5-flash-lite"
         )
         
         print(f"\n✅ Generated variations:")

@@ -183,7 +183,7 @@ def add_miner_args(cls, parser):
         "--neuron.gemini_model_name",
         type=str,
         help="Gemini model to use (default: gemini-2.0-flash-exp)",
-        default="gemini-2.0-flash-exp",
+        default="gemini-2.5-flash-lite",
     )
 
     parser.add_argument(
