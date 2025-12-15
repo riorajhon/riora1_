@@ -4,8 +4,8 @@ import random
 def get_address(country_name, count=1):
     """Send country name and count, get addresses from MongoDB"""
     try:
-        # Connect to MongoDB
-        client = pymongo.MongoClient('mongodb://localhost:27017/')
+        # Connect to MongoDB with authentication
+        client = pymongo.MongoClient("mongodb://admin:wkrjk!20020415@localhost:27017/?authSource=admin")
         db = client['address']
         collection = db['addresses']
         
