@@ -10,7 +10,10 @@ def get_address(country_name, count=1):
         collection = db['addresses']
         
         # Find addresses with state False
-        addresses = list(collection.find({"country": country_name, "state": False}).limit(count))
+        addresses = list(collection.find({
+                        "country": {"$regex": f"^{country_name}$", "$options": "i"}, 
+                        "state": False
+                    }).limit(count))
         
         # Update all selected addresses to True in one operation
         address_ids = [address["_id"] for address in addresses]
@@ -22,5 +25,5 @@ def get_address(country_name, count=1):
         return f"Error: {e}"
 # Test
 if __name__ == "__main__":
-    print(get_address("Germany", count=3))
+    print(get_address("germany", count=3))
    
