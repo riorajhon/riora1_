@@ -22,5 +22,5 @@ def get_address(country_name, count=1):
         return f"Error: {e}"
 # Test
 if __name__ == "__main__":
-    print(get_address("germany", count=3))
+    print(get_address("Germany", count=3))
    
