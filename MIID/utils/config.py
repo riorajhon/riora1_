@@ -165,28 +165,6 @@ def add_miner_args(cls, parser):
     )
 
     parser.add_argument(
-        "--neuron.llm_provider",
-        type=str,
-        choices=["ollama", "gemini"],
-        help="LLM provider to use: 'ollama' for local Ollama or 'gemini' for Google Gemini API (default: ollama)",
-        default="ollama",
-    )
-
-    parser.add_argument(
-        "--neuron.gemini_api_key",
-        type=str,
-        help="Google Gemini API key (required if using gemini provider). Can also be set via GEMINI_API_KEY environment variable.",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--neuron.gemini_model_name",
-        type=str,
-        help="Gemini model to use (default: gemini-2.0-flash-exp)",
-        default="gemini-2.5-flash-lite",
-    )
-
-    parser.add_argument(
         "--blacklist.force_validator_permit",
         action="store_true",
         help="If set, we will force incoming requests to have a permit.",
@@ -469,10 +447,24 @@ def add_validator_args(cls, parser):
     parser.add_argument(
         '--neuron.burn_fraction',
         type=float,
-        help="Fraction of emissions to burn to the burn UID when miners qualify (default: 0.40 = 40%).",
-        default=0.40
+        help="Fraction of emissions to burn to the burn UID when miners qualify.",
+        default=0.75
     )
     # Note: burn_uid is hardcoded to 59 and not configurable
+    
+    # --- Nominatim Cache Configuration ---
+    parser.add_argument(
+        '--neuron.nominatim_cache_enabled',
+        action='store_true',
+        help="Enable caching of Nominatim API results to reduce API calls.",
+        default=True
+    )
+    parser.add_argument(
+        '--neuron.nominatim_cache_max_size',
+        type=int,
+        help="Maximum number of entries in the Nominatim cache. Lower values reduce memory usage.",
+        default=10000
+    )
 
 
 def config(cls):
@@ -485,8 +477,4 @@ def config(cls):
     bt.logging.add_args(parser)
     bt.Axon.add_args(parser)
     cls.add_args(parser)
-    
-    # Override default axon port to 8081 for this project
-    parser.set_defaults(axon_port=8081)
-    
     return bt.Config(parser)

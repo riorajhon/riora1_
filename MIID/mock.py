@@ -45,7 +45,7 @@ class MockMetagraph(bt.Metagraph):
 
         for axon in self.axons:
             axon.ip = "127.0.0.0"
-            axon.port = 8081
+            axon.port = 8091
 
         bt.logging.info(f"Metagraph: {self}")
         bt.logging.info(f"Axons: {self.axons}")

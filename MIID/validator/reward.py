@@ -43,7 +43,19 @@ from MIID.validator.cheat_detection import (
     overlap_coefficient,
     jaccard,
     detect_cheating_patterns,
+    remove_disallowed_unicode,
+    normalize_address_for_deduplication,
 )
+from MIID.validator.cache import LRUCache
+
+HOTKEY_TO_VALIDATOR_NAME: Dict[str, str] = {
+    "5DUB7kNLvvx8Dj7D8tn54N1C7Xok6GodNPQE2WECCaL9Wgpr": "MIIDOwner",
+    "5GWzXSra6cBM337nuUU7YTjZQ6ewT2VakDpMj8Pw2i8v8PVs": "Yuma",
+    "5C4qiYkqKjqGDSvzpf6YXCcnBgM6punh8BQJRP78bqMGsn54": "RT21",
+    "5HK5tp6t2S59DywmHRWPBVJeJ86T61KjurYqeooqj8sREpeN": "Tensora",
+    "5HbUFHW4XVhbQvMbSy7WDjvhHb62nuYgP1XBsmmz9E2E2K6p": "OTF",
+    "5GQqAhLKVHRLpdTqRg1yc3xu7y47DicJykSpggE2GuDbfs54": "Rizzo",
+}
 
 def clean_transliteration_output(raw_response: str) -> str:
     """
@@ -190,6 +202,24 @@ def calculate_orthographic_similarity(original_name: str, variation: str) -> flo
         bt.logging.warning(f"Error calculating orthographic score: {str(e)}")
         return 0.0
 
+def has_excessive_letter_repetition(text: str, max_repetition: int = 2) -> bool:
+    """
+    Check if a string has any letter repeated more than max_repetition times consecutively.
+    
+    Args:
+        text: The text to check
+        max_repetition: Maximum allowed consecutive repetitions (default: 2, so "aaa" is excessive)
+        
+    Returns:
+        True if there are more than max_repetition consecutive identical letters, False otherwise
+    """
+    if not text:
+        return False
+    
+    # Use regex to find sequences of 3 or more identical letters (case-insensitive)
+    pattern = r'(.)\1{' + str(max_repetition) + r',}'
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
 def looks_like_address(address: str) -> bool:
     address = address.strip().lower()
 
@@ -282,47 +312,99 @@ def compute_bounding_box_areas_meters(nominatim_results):
     return areas
 
 
-def check_with_nominatim(address: str, validator_uid: int, miner_uid: int, seed_address: str, seed_name: str) -> Union[float, str, dict]:
+# Global cache instance for Nominatim API results
+# Max size of 10000 entries (~36 MB memory usage)
+_nominatim_cache = LRUCache(max_size=10000)
+_cache_enabled = None  # Will be initialized from config.neuron.nominatim_cache_enabled
+
+# Cache statistics tracking
+_cache_stats = {
+    "cache_hits": 0,
+    "api_calls": 0
+}
+
+
+def check_with_nominatim(address: str, validator_uid: int, miner_uid: int, seed_address: str, seed_name: str, validator_hotkey: str = None) -> Union[float, str, dict]:
     """
     Validates address using Nominatim API and returns a score based on bounding box areas.
-    Returns: dict with 'score' and 'details' for success, "TIMEOUT" for timeout, or 0.0 for failure
+    Returns:
+        - dict with 'score' and 'num_results' for success
+        - "TIMEOUT" for timeout
+        - "API_ERROR" for API failures (network errors, exceptions)
+        - 0.0 for invalid address (API succeeded but address not found/filtered out)
+    
+    Results are cached to avoid repeated API calls for the same address.
+    Addresses are normalized using normalize_address_for_deduplication so that similar
+    addresses (e.g., "House 4" vs "House 1" in the same location) share the same cache entry.
+    
+    Cache only stores the score to minimize memory usage.
     """
+    global _cache_stats
+    
+    # Normalize address for cache key using deduplication normalization
+    # This ensures addresses like "House 4" and "House 1" at the same location share cache
+    cache_key = normalize_address_for_deduplication(address)
+    
+    # Check if cache is enabled and we have a valid cache key
+    # Default to True if not yet initialized from config
+    cache_enabled = _cache_enabled if _cache_enabled is not None else True
+    use_cache = cache_enabled and bool(cache_key) and _nominatim_cache is not None
+    
+    if use_cache:
+        # Check cache first
+        cached_result = _nominatim_cache.get(cache_key)
+        if cached_result is not None:
+            _cache_stats["cache_hits"] += 1
+            bt.logging.debug(f"Cache hit for address: {address}")
+            # Cached result is just the score (float), return as dict with only score
+            if isinstance(cached_result, (int, float)):
+                return {"score": float(cached_result)}
+            return cached_result
+        bt.logging.debug(f"Cache miss for address: {address}")
+    elif not cache_enabled:
+        bt.logging.debug(f"Cache disabled, making API call for: {address}")
+    else:
+        bt.logging.debug(f"Address normalization resulted in empty key, skipping cache for: {address}")
+    
+    # Cache miss or no cache key - make API call
+    _cache_stats["api_calls"] += 1
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": address, "format": "json"}
         
-        # Use validator_uid to create a unique User-Agent per validator
+        # Use validator hotkey to get validator name from mapping and create a unique User-Agent
         # Each validator consistently uses its own User-Agent for all requests
-        # Format: AppName/ValidatorUID (contact email)
-        # CRITICAL: Nominatim requires proper User-Agent with contact info to avoid 403 errors
-        default_user_agent = "MIIDSubnet/1.0 (contact: prasadpsd2001@gmail.com)"
-        user_agent = os.getenv("USER_AGENT", default_user_agent)
+        # if validator_hotkey and validator_hotkey in HOTKEY_TO_VALIDATOR_NAME:
+        #     validator_name = HOTKEY_TO_VALIDATOR_NAME[validator_hotkey]
+        #     user_agent = (
+        #         f"MIID-Subnet/1.0 (YANEZ-MIID Team; "
+        #         f"https://github.com/yanez-compliance/MIID-subnet; "
+        #         f"Validator: {validator_name}; "
+        #         f"Using OpenStreetMap/Nominatim data under ODbL)"
+        #     )
+        # else:
+        #     # Fallback if hotkey not found in mapping
+        #     user_agent = (
+        #         f"MIID-Subnet/1.0 (YANEZ-MIID Team; "
+        #         f"https://github.com/yanez-compliance/MIID-subnet; "
+        #         f"Using OpenStreetMap/Nominatim data under ODbL)"
+        #     )
+
+
+        nominatim_headers = {
+            # "User-Agent": user_agent
+            "User-Agent": "evaluating variations"
+        }
         
-        # Support proxy rotation via environment variable
-        proxy_url = os.getenv("PROXY_URL", None)
-        proxies = None
-        if proxy_url:
-            proxies = {
-                "http": proxy_url,
-                "https": proxy_url
-            }
-        # Disable SSL verification when using proxy (proxy uses its own certificate)
-        verify_ssl = proxy_url is None  # Only verify SSL if not using proxy
-        response = requests.get(url, params=params, headers={"User-Agent": user_agent}, timeout=5, proxies=proxies, verify=verify_ssl)
-        
-        # Check status code before parsing JSON (403 errors return HTML, not JSON)
-        if response.status_code != 200:
-            if response.status_code == 403:
-                bt.logging.warning(f"Nominatim 403 Forbidden for address '{address}' - rate limited or blocked")
-            else:
-                bt.logging.warning(f"Nominatim HTTP {response.status_code} for address '{address}'")
-            return 0.0
-        
+        response = requests.get(url, params=params, headers=nominatim_headers, timeout=5)
         results = response.json()
         
         # Check if we have any results
         if len(results) == 0:
-            return 0.0
+            result = 0.0
+            if use_cache:
+                _nominatim_cache.put(cache_key, result)
+            return result
         
         # Extract numbers from the original address for matching
         original_numbers = set(re.findall(r"[0-9]+", address.lower()))
@@ -347,68 +429,116 @@ def check_with_nominatim(address: str, validator_uid: int, miner_uid: int, seed_
             if display_name:
                 display_numbers = set(re.findall(r"[0-9]+", display_name.lower()))
                 if original_numbers:
-                    # Ensure display numbers are a subset of original numbers (no new numbers introduced)
-                    if display_numbers and not display_numbers.issubset(original_numbers):
+                    # Ensure display numbers exactly match original numbers (no new numbers, no missing numbers)
+                    if display_numbers != original_numbers:
                         continue
             
             filtered_results.append(result)
         
         # If no results pass the filters, return 0.0
         if len(filtered_results) == 0:
-            return 0.0
+            result = 0.0
+            if use_cache:
+                _nominatim_cache.put(cache_key, result)
+            return result
         
         # Calculate bounding box areas for all results (not just filtered)
         areas_data = compute_bounding_box_areas_meters(results)
         
         if len(areas_data) == 0:
-            return 0.0
+            result = 0.0
+            if use_cache:
+                _nominatim_cache.put(cache_key, result)
+            return result
         
         # Extract areas
         areas = [item["area_m2"] for item in areas_data]
         
-        # Use the smallest area for scoring
-        min_area = min(areas)
+        # Use the total area for scoring
+        total_area = sum(areas)
         
-        # Score based on smallest area
-        if min_area < 100:
+        # Score based on total area
+        if total_area < 100:
             score = 1.0
-        elif min_area < 1000:
+        elif total_area < 1000:
             score = 0.9
-        elif min_area < 10000:
+        elif total_area < 10000:
             score = 0.8
-        elif min_area < 100000:
+        elif total_area < 100000:
             score = 0.7
         else:
             score = 0.3
         
-        # Store score details
+        # Store simplified score details (only score and num_results for cache)
+        num_results = len(areas)
+        
+        # Full details for return value (includes all data for current use)
         score_details = {
             "score": score,
+            "num_results": num_results,
             "areas": areas,
-            "min_area": min_area,
-            "num_results": len(areas),
+            "total_area": total_area,
             "areas_data": areas_data
         }
+        
+        # Cache only the score to save memory
+        if use_cache:
+            _nominatim_cache.put(cache_key, score)
         
         return score_details
     except requests.exceptions.Timeout:
         bt.logging.warning(f"API timeout for address: {address}")
-        return "TIMEOUT"
+        result = "TIMEOUT"
+        # Don't cache timeouts - they might succeed on retry
+        return result
     except requests.exceptions.RequestException as e:
         bt.logging.error(f"Request exception for address '{address}': {type(e).__name__}: {str(e)}")
-        return 0.0
+        result = "API_ERROR"
+        # Don't cache API failures - they might succeed on retry
+        return result
     except ValueError as e:
         error_msg = str(e)
         # Check if it's an encoding error (like latin-1 codec issues)
         if "codec" in error_msg.lower() and "encode" in error_msg.lower():
             bt.logging.warning(f"Encoding error for address '{address}' (treating as timeout): {error_msg}")
-            return "TIMEOUT"
+            result = "TIMEOUT"
+            # Don't cache timeouts - they might succeed on retry
+            return result
         else:
             bt.logging.error(f"ValueError (likely JSON parsing) for address '{address}': {error_msg}")
-            return 0.0
+            result = "API_ERROR"
+            # Don't cache API failures - they might succeed on retry
+            return result
     except Exception as e:
         bt.logging.error(f"Unexpected exception for address '{address}': {type(e).__name__}: {str(e)}")
         bt.logging.error(f"Traceback: {traceback.format_exc()}")
+        result = "API_ERROR"
+        # Don't cache API failures - they might succeed on retry
+        return result
+
+def check_with_photon(address: str) -> Union[float, str]:
+    """
+    Check address with Photon API.
+    Returns: float score (1.0 for success, 0.0 for failure) or "TIMEOUT" string
+    """
+    try:
+        url = "https://photon.komoot.io/api/"
+        params = {"q": address}
+
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Return 0.0 if features list is empty
+        if not data.get('features') or len(data.get('features', [])) == 0:
+            return 0.0
+
+        return 1.0
+    except requests.exceptions.Timeout:
+        bt.logging.warning(f"Photon API timeout for address: {address}")
+        return "TIMEOUT"
+    except Exception as e:
+        bt.logging.error(f"Error checking address with Photon API: {type(e).__name__}: {str(e)}")
         return 0.0
 
 # Global country name mapping to handle variations between miner submissions and geonames data
@@ -630,6 +760,33 @@ def city_in_country(city_name: str, country_name: str) -> bool:
         bt.logging.warning(f"Error checking city '{city_name}' in country '{country_name}': {str(e)}")
         return False
 
+def check_western_sahara_cities(generated_address: str) -> bool:
+    """
+    Check if any Western Sahara city appears in the generated address.
+    
+    Args:
+        generated_address: The generated address to check
+        
+    Returns:
+        True if any Western Sahara city is found in the address, False otherwise
+    """
+    if not generated_address:
+        return False
+    
+    # Western Sahara cities
+    WESTERN_SAHARA_CITIES = [
+        "laayoune", "dakhla", "boujdour", "es semara", "sahrawi", "tifariti", "aousserd"
+    ]
+    
+    gen_lower = generated_address.lower()
+    
+    # Check if any of the cities appear in the generated address
+    for city in WESTERN_SAHARA_CITIES:
+        if city in gen_lower:
+            return True
+    
+    return False
+
 def validate_address_region(generated_address: str, seed_address: str) -> bool:
     """
     Validate that generated address has correct region from seed address.
@@ -648,11 +805,15 @@ def validate_address_region(generated_address: str, seed_address: str) -> bool:
         return False
     
     # Special handling for disputed regions not in geonames
-    SPECIAL_REGIONS = ["luhansk", "crimea", "donetsk", "west sahara", 'western sahara']
-    
-    # Check if seed address is one of the special regions
     seed_lower = seed_address.lower()
-    if seed_lower in SPECIAL_REGIONS:
+    
+    # Special handling for Western Sahara - check for cities instead of region name
+    if seed_lower in ["west sahara", "western sahara"]:
+        return check_western_sahara_cities(generated_address)
+    
+    # Other special regions
+    OTHER_SPECIAL_REGIONS = ["luhansk", "crimea", "donetsk"]
+    if seed_lower in OTHER_SPECIAL_REGIONS:
         # If seed is a special region, check if that region appears in generated address
         gen_lower = generated_address.lower()
         return seed_lower in gen_lower
@@ -808,9 +969,16 @@ def calculate_part_score(
             count_score = math.exp(-deviation / expected_count)
             #bt.logging.info(f"Count score: {count_score:.3f} (penalty for deviation: {deviation})")
     
-    # 2. Enhanced uniqueness check with similarity clustering
+    # 2. Enhanced uniqueness check with similarity clustering and excessive repetition filtering
     unique_variations = []
+    filtered_count = 0
     for var in variations:
+        # Filter out variations with excessive letter repetition (more than 2 consecutive identical letters)
+        if has_excessive_letter_repetition(var, max_repetition=2):
+            filtered_count += 1
+            #bt.logging.warning(f"Filtered variation '{var}' due to excessive letter repetition")
+            continue
+        
         # Check if this variation is too similar to any existing unique variation
         is_unique = True
         for unique_var in unique_variations:
@@ -824,6 +992,12 @@ def calculate_part_score(
                 break
         if is_unique:
             unique_variations.append(var)
+    
+    # Calculate penalty for filtered variations (excessive repetition)
+    filter_penalty = 0.0
+    if filtered_count > 0:
+        filter_penalty = min(0.2, filtered_count * 0.05)  # Up to 20% penalty
+        #bt.logging.warning(f"Filtered {filtered_count} variations with excessive repetition (penalty: {filter_penalty:.3f})")
     
     uniqueness_score = len(unique_variations) / len(variations) if variations else 0
     # if uniqueness_score < 1.0:
@@ -954,6 +1128,10 @@ def calculate_part_score(
         length_weight * length_score
     )
     
+    # Apply penalty for filtered variations with excessive letter repetition
+    if filter_penalty > 0:
+        final_score = max(0.0, final_score * (1.0 - filter_penalty))
+    
     # # DETAILED LOGGING FOR DEBUGGING 0.0 SCORES
     # bt.logging.info(f"--- DETAILED SCORE CALCULATION FOR '{original_part}' ---")
     # bt.logging.info(f"Similarity Score: {similarity_score:.4f} (Weight: {similarity_weight}) -> Contributes: {similarity_weight * similarity_score:.4f}")
@@ -1055,9 +1233,16 @@ def calculate_part_score_phonetic_only(
             count_score = math.exp(-deviation / expected_count)
             #bt.logging.info(f"Count score: {count_score:.3f} (penalty for deviation: {deviation})")
     
-    # 2. Enhanced uniqueness check with phonetic similarity clustering
+    # 2. Enhanced uniqueness check with phonetic similarity clustering and excessive repetition filtering
     unique_variations = []
+    filtered_count = 0
     for var in variations:
+        # Filter out variations with excessive letter repetition (more than 2 consecutive identical letters)
+        if has_excessive_letter_repetition(var, max_repetition=2):
+            filtered_count += 1
+            #bt.logging.warning(f"Filtered variation '{var}' due to excessive letter repetition")
+            continue
+        
         # Check if this variation is too similar to any existing unique variation
         is_unique = True
         for unique_var in unique_variations:
@@ -1068,6 +1253,12 @@ def calculate_part_score_phonetic_only(
                 break
         if is_unique:
             unique_variations.append(var)
+    
+    # Calculate penalty for filtered variations (excessive repetition)
+    filter_penalty = 0.0
+    if filtered_count > 0:
+        filter_penalty = min(0.2, filtered_count * 0.05)  # Up to 20% penalty
+        #bt.logging.warning(f"Filtered {filtered_count} variations with excessive repetition (penalty: {filter_penalty:.3f})")
     
     uniqueness_score = len(unique_variations) / len(variations) if variations else 0
     
@@ -1167,6 +1358,11 @@ def calculate_part_score_phonetic_only(
         uniqueness_weight * uniqueness_score +
         length_weight * length_score
     )
+    
+    # Apply penalty for filtered variations with excessive letter repetition
+    if filter_penalty > 0:
+        final_score = max(0.0, final_score * (1.0 - filter_penalty))
+    
     if final_score == 0:
         bt.logging.warning(f"Zero score for '{original_part}'. Possible reasons:")
         if len(variations) == 0:
@@ -1882,8 +2078,16 @@ def _grade_dob_variations(variations: Dict[str, List[List[str]]], seed_dob: List
         "detailed_breakdown": detailed_breakdown
     }
 
-def _grade_address_variations(variations: Dict[str, List[List[str]]], seed_addresses: List[str], miner_metrics: Dict[str, Any], validator_uid: int, miner_uid: int) -> Dict[str, Any]:
+def _grade_address_variations(variations: Dict[str, List[List[str]]], seed_addresses: List[str], miner_metrics: Dict[str, Any], validator_uid: int, miner_uid: int, validator_hotkey: str = None, config=None) -> Dict[str, Any]:
     """Grade address variations - check all with heuristics, one random with API, and region validation."""
+    # Initialize cache enabled state from config
+    global _cache_enabled
+    if config is not None:
+        _cache_enabled = getattr(config.neuron, 'nominatim_cache_enabled', True)
+    elif _cache_enabled is None:
+        # If no config provided and not yet initialized, default to enabled
+        _cache_enabled = True
+    
     if not seed_addresses or not any(seed_addresses):
         return {"overall_score": 1.0}
     
@@ -2020,17 +2224,33 @@ def _grade_address_variations(variations: Dict[str, List[List[str]]], seed_addre
         
         # Try Nominatim API (up to 3 calls)
         nominatim_scores = []
+        failure_count = 0  # Track consecutive failures for exponential backoff
+        api_error_count = 0  # Track total API_ERROR results (for fallback to Photon)
+        addresses_with_api_errors = []  # Store addresses that resulted in API_ERROR
         for i, (addr, seed_addr, seed_name) in enumerate(nominatim_addresses):
-            result = check_with_nominatim(addr, validator_uid, miner_uid, seed_addr, seed_name)
+            result = check_with_nominatim(addr, validator_uid, miner_uid, seed_addr, seed_name, validator_hotkey)
             
             # Extract score and details from result
+            # Cache returns simplified dict with only score (no num_results)
             score = None
             score_details = None
             if isinstance(result, dict) and "score" in result:
                 score = result["score"]
-                score_details = result
+                # If it's a cached result (only has score, no areas_data), use minimal details
+                if "areas_data" not in result:
+                    # This is a cached simplified result - only score, no num_results
+                    score_details = {
+                        "score": result["score"]
+                    }
+                else:
+                    # Full result from API call
+                    score_details = result
             elif result == "TIMEOUT":
                 score = "TIMEOUT"
+            elif result == "API_ERROR":
+                score = "API_ERROR"
+                api_error_count += 1
+                addresses_with_api_errors.append((addr, seed_addr, seed_name))
             else:
                 score = result if isinstance(result, (int, float)) else 0.0
             
@@ -2042,21 +2262,142 @@ def _grade_address_variations(variations: Dict[str, List[List[str]]], seed_addre
                 "attempt": i + 1
             })
             
+            # Handle result and apply exponential backoff for API failures/timeouts only
+            # Distinguish between:
+            # - 0.0 = API succeeded but address is invalid (bad address) - no backoff needed
+            # - "API_ERROR" = API call failed (network error, exception) - apply backoff
+            # - "TIMEOUT" = API timeout - apply backoff
             if result == "TIMEOUT":
                 nominatim_timeout_calls += 1
-                time.sleep(1.0)
+                failure_count += 1
+                wait_time = min(1.0 * (2 ** failure_count), 10.0)  # Exponential backoff, max 10s
+                bt.logging.debug(f"Timeout - waiting {wait_time:.2f}s (failure count: {failure_count})")
+                if i < len(nominatim_addresses) - 1:
+                    time.sleep(wait_time)
+            elif result == "API_ERROR":
+                nominatim_timeout_calls += 1
+                failure_count += 1
+                wait_time = min(1.0 * (2 ** failure_count), 10.0)  # Exponential backoff, max 10s
+                bt.logging.debug(f"API error - waiting {wait_time:.2f}s (failure count: {failure_count})")
+                if i < len(nominatim_addresses) - 1:
+                    time.sleep(wait_time)
             elif isinstance(result, dict) and result.get("score", 0) > 0.0:
                 nominatim_successful_calls += 1
                 nominatim_scores.append(result["score"])
+                failure_count = 0  # Reset on success
+                if i < len(nominatim_addresses) - 1:
+                    time.sleep(1.0)  # Normal wait between calls
             elif isinstance(result, (int, float)) and result > 0.0:
                 nominatim_successful_calls += 1
                 nominatim_scores.append(result)
+                failure_count = 0  # Reset on success
+                if i < len(nominatim_addresses) - 1:
+                    time.sleep(1.0)  # Normal wait between calls
             else:
+                # result == 0.0: API succeeded but address is invalid (bad address)
+                # Don't apply exponential backoff - API worked fine, address is just bad
                 nominatim_failed_calls += 1
+                failure_count = 0  # Reset since API call succeeded
+                if i < len(nominatim_addresses) - 1:
+                    time.sleep(1.0)  # Normal wait between calls
+        
+        # Fallback to Photon API if we got 3 API_ERROR results (all addresses failed with API_ERROR)
+        # This triggers when we get API_ERROR for all addresses we checked (up to 3)
+        if api_error_count >= 3 and addresses_with_api_errors and len(addresses_with_api_errors) >= 3:
+            bt.logging.warning(f"Got {api_error_count} API_ERROR results from Nominatim. Falling back to Photon API for {len(addresses_with_api_errors)} addresses.")
             
-            # Wait 1 second between API calls to prevent rate limiting
-            if i < len(nominatim_addresses) - 1:
-                time.sleep(1.0)
+            # Reset scores and counters for Photon API fallback
+            photon_scores = []
+            photon_successful_calls = 0
+            photon_timeout_calls = 0
+            photon_failed_calls = 0
+            
+            # Use Photon API for the addresses that had API_ERROR from Nominatim
+            for idx, (addr, seed_addr, seed_name) in enumerate(addresses_with_api_errors):
+                # Call Photon API to check the address
+                photon_result = check_with_photon(addr)
+                
+                # Process Photon API result and convert to match scoring format
+                if photon_result == "TIMEOUT":
+                    photon_timeout_calls += 1
+                    api_attempts.append({
+                        "address": addr,
+                        "api": "photon",
+                        "result": "TIMEOUT",
+                        "score_details": None,
+                        "attempt": len(api_attempts) + 1,
+                        "fallback": True
+                    })
+                elif isinstance(photon_result, (int, float)):
+                    if photon_result > 0.0:
+                        photon_successful_calls += 1
+                        photon_scores.append(photon_result)
+                        api_attempts.append({
+                            "address": addr,
+                            "api": "photon",
+                            "result": photon_result,
+                            "score_details": {"score": photon_result},
+                            "attempt": len(api_attempts) + 1,
+                            "fallback": True
+                        })
+                    else:
+                        photon_failed_calls += 1
+                        api_attempts.append({
+                            "address": addr,
+                            "api": "photon",
+                            "result": photon_result,
+                            "score_details": None,
+                            "attempt": len(api_attempts) + 1,
+                            "fallback": True
+                        })
+                
+                # Add delay between Photon API calls to respect rate limits
+                if idx < len(addresses_with_api_errors) - 1:
+                    time.sleep(1.0)
+            
+            # Calculate results from Photon API and return early
+            total_calls = len(addresses_with_api_errors)
+            total_successful = photon_successful_calls
+            total_timeouts = photon_timeout_calls
+            total_failed = photon_failed_calls
+            
+            if total_failed > 0:
+                api_result = "FAILED"  # Any failure = 0.0 score
+            elif total_timeouts > 0:
+                api_result = "TIMEOUT"  # All pass but timeouts = -0.2 per timeout
+            else:
+                api_result = "SUCCESS"  # All pass without timeouts = perfect score
+            
+            # Scoring based on Photon API results
+            if photon_failed_calls > 0 or len(photon_scores) == 0:
+                # Any failure or no successful calls results in 0.3 score
+                base_score = 0.3
+            else:
+                # Use the average of all successful Photon API call scores
+                base_score = sum(photon_scores) / len(photon_scores)
+            
+            # Store API validation results with Photon API data
+            address_breakdown["api_validation"] = {
+                "api_result": api_result,
+                "total_eligible_addresses": len(api_validated_addresses),
+                "api_attempts": api_attempts,
+                "photon_successful_calls": photon_successful_calls,
+                "photon_timeout_calls": photon_timeout_calls,
+                "photon_failed_calls": photon_failed_calls,
+                "total_successful_calls": total_successful,
+                "total_timeout_calls": total_timeouts,
+                "total_failed_calls": total_failed,
+                "total_calls": total_calls
+            }
+            
+            return {
+                "overall_score": base_score,
+                "heuristic_perfect": heuristic_perfect,
+                "api_result": api_result,
+                "region_matches": region_matches,
+                "total_addresses": len(all_addresses),
+                "detailed_breakdown": address_breakdown
+            }
         
         
         # Set final result based on Nominatim API results
@@ -2453,12 +2794,54 @@ def get_name_variation_rewards(
             # Penalty for duplicate variations - addresses (with normalization)
             address_duplicates_penalty = 0.0
             if address_variations:  # Check if address list exists and is not empty
+                # First, check for exact duplicates (existing logic)
                 normalized_addresses = [normalize_address(addr) for addr in address_variations if addr]  # Filter out empty strings
                 duplicates_addresses = len(normalized_addresses) - len(set(normalized_addresses))
                 if duplicates_addresses > 0:
                     penalty_duplicates = duplicates_addresses * 0.05  # e.g. 5% penalty per duplicate
                     # bt.logging.info(f"Duplicate address variations for {name}: {duplicates_addresses} duplicates → penalty {penalty_duplicates}")
                     address_duplicates_penalty += penalty_duplicates
+                
+                # Second, check for duplicate first sections (before first comma)
+                first_sections = []
+                for addr in address_variations:
+                    if addr and addr.strip():
+                        # Remove disallowed Unicode characters (symbols, emoji, etc.) but preserve commas
+                        addr = remove_disallowed_unicode(addr, preserve_comma=True)
+                        if not addr or not addr.strip():
+                            continue
+                        # Strip leading commas and spaces to prevent gaming the system
+                        # (miners might add ", " at the front to bypass duplicate detection)
+                        normalized_addr = addr.strip().lstrip(',').strip()
+                        if not normalized_addr:
+                            continue
+                        # Split on comma and get the first section
+                        parts = normalized_addr.split(',')
+                        if parts:
+                            first_section = parts[0].strip()
+                            # If first section is less than 3 characters, combine with second section
+                            if len(first_section) < 4 and len(parts) > 1:
+                                # Combine first 2 sections (remove the comma between them)
+                                first_section = (parts[0].strip() + " " + parts[1].strip()).strip()
+                            # Normalize the first section (lowercase, remove extra spaces, remove 2-letter words)
+                            words = first_section.split()
+                            # Filter out 2-letter words
+                            filtered_words = [word for word in words if len(word) > 2]
+                            normalized_first = " ".join(filtered_words).lower().strip()
+                            if normalized_first:  # Only add if not empty after filtering
+                                first_sections.append(normalized_first)
+                
+                if first_sections:
+                    # Count how many addresses share the same first section using dictionary
+                    first_section_counts = {}
+                    for section in first_sections:
+                        first_section_counts[section] = first_section_counts.get(section, 0) + 1
+                    # Penalize if any first section appears more than once
+                    duplicate_first_sections = sum(count - 1 for count in first_section_counts.values() if count > 1)
+                    if duplicate_first_sections > 0:
+                        penalty_first_section = duplicate_first_sections * 0.05  # 5% penalty per duplicate first section
+                        # bt.logging.info(f"Duplicate first sections for {name}: {duplicate_first_sections} duplicates → penalty {penalty_first_section}")
+                        address_duplicates_penalty += penalty_first_section
             
             address_duplicates_penalty = min(address_duplicates_penalty, 0.5)  # Max 50% penalty
 
@@ -2666,7 +3049,13 @@ def get_name_variation_rewards(
         
         # Grade address variations before final reward calculation
         start_time = time.time()
-        address_grading_score = _grade_address_variations(variations, seed_addresses, miner_metrics, self.uid, uid)
+        # Get validator hotkey for user agent mapping
+        validator_hotkey = None
+        if hasattr(self, 'metagraph') and hasattr(self.metagraph, 'hotkeys') and self.uid < len(self.metagraph.hotkeys):
+            validator_hotkey = str(self.metagraph.hotkeys[self.uid])
+        elif hasattr(self, 'wallet') and hasattr(self.wallet, 'hotkey'):
+            validator_hotkey = str(self.wallet.hotkey.ss58_address)
+        address_grading_score = _grade_address_variations(variations, seed_addresses, miner_metrics, self.uid, uid, validator_hotkey, config=self.config)
         miner_metrics["address_grading"] = address_grading_score
         end_time = time.time()
         bt.logging.info(f"Address grading time: {end_time - start_time:.2f} seconds")
@@ -2760,7 +3149,7 @@ def get_name_variation_rewards(
         # detailed_metrics would remain as calculated before the penalty step
     
     # Get burn configuration from config with defaults
-    burn_fraction = getattr(self.config.neuron, 'burn_fraction', 0.40)
+    burn_fraction = getattr(self.config.neuron, 'burn_fraction', 0.75)
     burn_uid = 59  # Hardcoded: burn UID is always 59 and never configurable
     keep_fraction = 1.0 - burn_fraction
     

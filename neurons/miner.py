@@ -18,100 +18,83 @@
 # DEALINGS IN THE SOFTWARE.
 
 """
-Name Variation Miner Module
+Modular Identity Variation Miner
 
-This module implements a Bittensor miner that generates alternative spellings for names
-using an LLM (Ollama or Google Gemini). 
+This module implements a clean, modular Bittensor miner that generates identity variations
+using specialized modules for each component:
 
-The miner supports two LLM providers:
-- Ollama: Local LLM (requires Ollama to be installed and running)
-- Gemini: Google Gemini API (requires API key)
+Architecture:
+1. parse_query/parse_query.py - Parses validator query templates
+2. name/name.py - Generates name variations  
+3. dob/dob.py - Generates date of birth variations
+4. address/address.py - Generates address variations
 
-The miner receives requests from validators containing
-a list of names and a query template, processes each name through the LLM, extracts
-the variations from the LLM's response, and returns them to the validator.
+Workflow:
+1. Receive IdentitySynapse from validator
+2. Parse query template to extract requirements
+3. For each identity, generate variations using specialized modules
+4. Combine variations into complete identity variations
+5. Return structured response to validator
 
-The miner follows these steps:
-1. Receive a request with names and a query template
-2. For each name, query the LLM to generate variations
-3. Process the LLM responses to extract clean variations
-4. Return the variations to the validator
-
-The processing logic handles different response formats from LLMs, including:
-- Comma-separated lists
-- Line-separated lists
-- Space-separated lists with numbering
-
-For debugging and analysis, the miner also saves:
-- Raw LLM responses
-- Processed variations in JSON format
-- A pandas DataFrame with the variations
-
-Each mining run is saved with a unique timestamp identifier to distinguish between
-different runs and facilitate analysis of results over time.
+This modular approach provides:
+- Clean separation of concerns
+- Easy maintenance and testing
+- Specialized optimization for each component
+- Maximum validator scoring through targeted generation
 """
 
 import time
 import typing
+import argparse
 import bittensor as bt
-import pandas as pd
 import os
-import numpy as np
 import sys
-from typing import List, Dict, Tuple, Any, Optional
-from tqdm import tqdm
-
-# Import clean variation generator
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from variation_generator_clean import generate_variations as generate_variations_clean
-
-# Conditionally import LLM providers
-try:
-    import ollama
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
-    bt.logging.warning("Ollama not available. Install with: pip install ollama")
-
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    bt.logging.warning("Google Generative AI not available. Install with: pip install google-generativeai")
+from typing import List, Dict, Any, Optional
 
 # Bittensor Miner Template:
 from MIID.protocol import IdentitySynapse
 
-# import base miner class which takes care of most of the boilerplate
+# Import base miner class which takes care of most of the boilerplate
 from MIID.base.miner import BaseMinerNeuron
 
 from bittensor.core.errors import NotVerifiedException
 
+# Import our modular components (keeping for potential future use)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# from parse_query.parse_query import parse_query_template
+# from name.name import generate_name_variations
+# from dob.dob import generate_dob_variations
+# from address.address import generate_address_variations
+
+# Optional imports for detailed metrics calculation
+try:
+    import jellyfish
+    JELLYFISH_AVAILABLE = True
+except ImportError:
+    JELLYFISH_AVAILABLE = False
+
 
 class Miner(BaseMinerNeuron):
     """
-    Name Variation Miner Neuron
+    Modular Identity Variation Miner Neuron
     
-    This miner receives requests from validators to generate alternative spellings for names,
-    and responds with variations generated using an LLM (Ollama or Google Gemini).
+    This miner uses a clean modular architecture to generate identity variations:
     
-    The miner handles the following tasks:
-    - Processing incoming requests for name variations
-    - Querying an LLM (Ollama or Gemini) to generate variations
-    - Extracting and cleaning variations from LLM responses
-    - Returning the processed variations to the validator
-    - Saving intermediate results for debugging and analysis
+    Components:
+    - Query Parser: Extracts requirements from validator query templates
+    - Name Generator: Creates name variations with phonetic/orthographic similarity
+    - DOB Generator: Creates date of birth variations with realistic deviations
+    - Address Generator: Creates address variations using real geocoded addresses
     
-    Each mining run is saved with a unique timestamp identifier to distinguish between
-    different runs and facilitate analysis of results over time.
+    The miner processes each identity component separately and combines them into
+    complete identity variations that maximize validator scoring.
     
-    Configuration:
-    - llm_provider: 'ollama' or 'gemini' (default: 'ollama')
-    - model_name: The Ollama model to use (default: 'tinyllama:latest')
-    - gemini_model_name: The Gemini model to use (default: 'gemini-2.0-flash-exp')
-    - gemini_api_key: Google Gemini API key (required for Gemini provider)
-    - output_path: Directory for saving mining results (default: logging_dir/mining_results)
+    Key Features:
+    - Modular design for easy maintenance
+    - Specialized generators for optimal scoring
+    - Real address generation via Nominatim API
+    - Comprehensive query requirement parsing
+    - Clean separation of concerns
     """
     WHITELISTED_VALIDATORS = {
         "5C4qiYkqKjqGDSvzpf6YXCcnBgM6punh8BQJRP78bqMGsn54": "RoundTable21",
@@ -126,41 +109,13 @@ class Miner(BaseMinerNeuron):
     }
 
     def __init__(self, config=None):
-        """
-        Initialize the Name Variation Miner.
         
-        Sets up the LLM client and creates directories for storing mining results.
-        Each run will be saved in a separate directory with a unique timestamp.
-        
-        Args:
-            config: Configuration object for the miner
-        """
         super(Miner, self).__init__(config=config)
         
-        bt.logging.info("=" * 80)
-        bt.logging.info("MINER: Using Gemini for maximum scoring")
-        bt.logging.info("=" * 80)
-        
-        # Initialize Gemini if available
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY") or getattr(self.config.neuron, 'gemini_api_key', None)
-        self.gemini_model = getattr(self.config.neuron, 'gemini_model_name', 'gemini-2.5-flash-lite')
-        
-        if self.gemini_api_key and GEMINI_AVAILABLE:
-            bt.logging.info(f"✅ Gemini configured: {self.gemini_model}")
-        else:
-            bt.logging.warning("⚠️  Gemini not available - falling back to variation_generator_clean.py")
-            if not GEMINI_AVAILABLE:
-                bt.logging.warning("   Install: pip install google-generativeai")
-            if not self.gemini_api_key:
-                bt.logging.warning("   Set GEMINI_API_KEY environment variable")
-        
-        # Create a directory for storing mining results (if needed)
-        self.output_path = os.path.join(self.config.logging.logging_dir, "mining_results")
-        os.makedirs(self.output_path, exist_ok=True)
-        bt.logging.info(f"Mining results directory: {self.output_path}")
-        
-        # Set up verification
+        # Set up validator verification
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
+        
+        bt.logging.info("#✅ Modular miner initialization complete")
 
     async def _verify_validator_request(self, synapse: IdentitySynapse) -> None:
         """
@@ -207,512 +162,79 @@ class Miner(BaseMinerNeuron):
         )
 
     async def forward(self, synapse: IdentitySynapse) -> IdentitySynapse:
-        """
-        Process a name variation request using Gemini for maximum scoring.
         
-        This is the main entry point for the miner's functionality. It:
-        1. Receives a request with names and a query template from validator
-        2. Parses the validator query template to extract all requirements
-        3. Uses Gemini to generate optimal variations that maximize scoring
-        4. Falls back to variation_generator_clean.py if Gemini is not available
-        5. Returns the variations to the validator
         
-        Args:
-            synapse: The IdentitySynapse containing names and query template
-            
-        Returns:
-            The synapse with variations field populated with name variations
-        """
         # Generate a unique run ID using timestamp
         run_id = int(time.time())
-        bt.logging.info(f"Starting run {run_id} for {len(synapse.identity)} names")
-        
-        # Log the ENTIRE validator synapse for debugging
-        bt.logging.info("=" * 80)
-        bt.logging.info("COMPLETE VALIDATOR SYNAPSE (FULL REQUEST)")
-        bt.logging.info("=" * 80)
-        try:
-            synapse_dict = {
-                "identity": synapse.identity,
-                "query_template": synapse.query_template,
-                "timeout": getattr(synapse, 'timeout', None),
-                "variations": getattr(synapse, 'variations', None),
-                "process_time": getattr(synapse, 'process_time', None),
-            }
-            import json
-            bt.logging.info(f"Identity: {json.dumps(synapse.identity, indent=2, ensure_ascii=False)}")
-            bt.logging.info(f"Query Template: {synapse.query_template}")
-            bt.logging.info(f"Timeout: {getattr(synapse, 'timeout', None)}")
-            bt.logging.info(f"Variations (initial): {getattr(synapse, 'variations', None)}")
-            bt.logging.info(f"Process Time (initial): {getattr(synapse, 'process_time', None)}")
-            
-            # Log validator info if available
-            if hasattr(synapse, 'dendrite') and synapse.dendrite:
-                bt.logging.info(f"Validator Hotkey: {synapse.dendrite.hotkey if synapse.dendrite else None}")
-            
-            bt.logging.info("=" * 80)
-        except Exception as e:
-            bt.logging.warning(f"Error logging synapse details: {e}")
-            bt.logging.info(f"Synapse identity count: {len(synapse.identity)}")
-            bt.logging.info(f"Query template length: {len(synapse.query_template)}")
+        start_time = time.time()
         
         # Get timeout from synapse (default to 120s if not specified)
         timeout = getattr(synapse, 'timeout', 120.0)
-        bt.logging.info(f"Request timeout: {timeout:.1f}s for {len(synapse.identity)} names")
-        start_time = time.time()
         
-        # Route request to Gemini generator (or fallback to clean generator)
         try:
-            if self.gemini_api_key and GEMINI_AVAILABLE:
-                bt.logging.info("Routing request to Gemini generator for maximum scoring")
-                from MIID.validator.gemini_generator import generate_variations_with_gemini
-                variations = generate_variations_with_gemini(
-                    synapse,
-                    gemini_api_key=self.gemini_api_key,
-                    gemini_model=self.gemini_model
-                )
-            else:
-                bt.logging.info("Routing request to variation_generator_clean.py (fallback)")
+            
+            # Import the working variation generator (now split into modules)
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'main'))
+            from _index import generate_variations as generate_variations_clean
+            
+            
+            # Use the proven generator that works
+            bt.logging.info("🔄 USING PROVEN VARIATION GENERATOR")
             variations = generate_variations_clean(synapse)
             
-            # Set the variations in the synapse for return to the validator
+            # Set variations in synapse
             synapse.variations = variations
             
-            # Calculate processing time
-            process_time = time.time() - start_time
-            synapse.process_time = process_time
+            # Log results
+            total_time = time.time() - start_time
             
-            # Log final timing information
-            bt.logging.info(
-                f"Request completed in {process_time:.2f}s of {timeout:.1f}s allowed. "
-                f"Processed {len(synapse.identity)}/{len(synapse.identity)} names."
-            )
+            # Calculate total variations (handle both regular and UAV formats)
+            total_variations = 0
+            if isinstance(variations, dict):
+                for name, name_variations in variations.items():
+                    if isinstance(name_variations, list):
+                        total_variations += len(name_variations)
+                    elif isinstance(name_variations, dict) and 'variations' in name_variations:
+                        total_variations += len(name_variations['variations'])
             
-            bt.logging.info(f"======== SYNAPSE VARIATIONS===============================================: {synapse.variations}")
-            bt.logging.info(f"==========================Processed variations for {len(synapse.variations)} names in run {run_id}")
-            bt.logging.info("========================================================================================")
+            # CRITICAL: Log final variations being returned
+            bt.logging.info("🎯 FINAL VARIATIONS BEING RETURNED:")
+            if isinstance(variations, dict):
+                for name, name_variations in variations.items():
+                    if isinstance(name_variations, list):
+                        print(f"   • {name}: {len(name_variations)} variations")
+                    elif isinstance(name_variations, dict) and 'variations' in name_variations:
+                        print(f"   • {name}: {len(name_variations['variations'])} variations (UAV format)")
+                    else:
+                        print(f"   • {name}: Unknown format")
+            
+            bt.logging.info(f"📊 FINAL STATS:")
+            bt.logging.info(f"   • Total names in synapse.variations: {len(variations) if isinstance(variations, dict) else 0}")
+            bt.logging.info(f"   • Total variations generated: {total_variations}")
+            bt.logging.info(f"   • Processing time: {total_time:.2f}s")
             
         except Exception as e:
-            bt.logging.error(f"Error generating variations: {str(e)}")
-            synapse.variations = {}
-            synapse.process_time = time.time() - start_time
+            bt.logging.error(f"❌ CRITICAL ERROR in variation generation: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            
+            # EMERGENCY FALLBACK: Create basic variations for all identities
+            bt.logging.error("🚨 EMERGENCY FALLBACK: Creating basic variations")
+            emergency_variations = {}
+            for identity in synapse.identity:
+                if len(identity) > 0:
+                    name = identity[0]
+                    dob = identity[1] if len(identity) > 1 else "1990-01-01"
+                    address = identity[2] if len(identity) > 2 else "Unknown"
+                    
+                    # Create 8 basic variations (common count)
+                    emergency_variations[name] = [[name, dob, address] for _ in range(8)]
+            
+            synapse.variations = emergency_variations
+            bt.logging.error(f"✅ EMERGENCY: Created variations for {len(emergency_variations)} names")
         
         return synapse
     
-    def Get_Respond_LLM(self, prompt: str) -> str:
-        """
-        Query the LLM using the configured provider (Ollama or Gemini).
-        
-        This function sends a prompt to the LLM and returns its response.
-        It supports both Ollama (local) and Google Gemini (API) providers.
-        
-        Args:
-            prompt: The prompt to send to the LLM
-            
-        Returns:
-            The LLM's response as a string
-            
-        Raises:
-            Exception: If there's an error communicating with the LLM
-        """
-        # Add ethical context and purpose explanation
-        context_prompt = f"""IMPORTANT CONTEXT: This is for generating synthetic test data only.
-Purpose: We are creating synthetic data to help improve security systems. This data will be used to:
-1. Test system robustness
-2. Identify potential vulnerabilities
-3. Improve detection mechanisms
-4. Generate training data for security systems
-
-This is purely for defensive testing and system improvement. The data generated will not be used for any malicious purposes.
-
-TASK: Based on this ethical context, please respond to the following query:
-
-{prompt}
-
-Remember: Only provide the name variations in a clean, comma-separated format.
-"""
-
-        try:
-            if self.llm_provider == 'gemini':
-                # Use Gemini API
-                model = genai.GenerativeModel(self.gemini_model_name)
-                response = model.generate_content(
-                    context_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=1024,
-                        temperature=0.7,
-                    )
-                )
-                return response.text
-            
-            elif self.llm_provider == 'ollama':
-                # Use Ollama
-                client = ollama.Client(host=getattr(self.config.neuron, 'ollama_url', 'http://127.0.0.1:11434'))
-                response = client.chat(
-                    self.model_name, 
-                    messages=[{
-                        'role': 'user',
-                        'content': context_prompt,
-                    }],
-                    options={
-                        # Add a reasonable timeout to ensure we don't get stuck
-                        "num_predict": 1024
-                    }
-                )
-                return response['message']['content']
-            else:
-                raise RuntimeError(f"Unknown LLM provider: {self.llm_provider}")
-                
-        except Exception as e:
-            bt.logging.error(f"LLM query failed with {self.llm_provider}: {str(e)}")
-            raise
-    
-    def process_variations(self, Response_list: List[str], run_id: int, run_dir: str, identity_list: List[List[str]]) -> Dict[str, List[List[str]]]:
-        """
-        Process LLM responses to extract identity variations.
-        
-        This function takes the raw LLM responses and extracts the name variations
-        using the Process_function. It then creates structured variations that include
-        name, DOB, and address variations for each identity.
-        
-        Args:
-            Response_list: List of LLM responses in the format:
-                          ["Respond", "---", "Query-{name}", "---", "{LLM response}"]
-            run_id: Unique identifier for this processing run
-            run_dir: Directory to save run-specific files
-            identity_list: List of identity arrays, each containing [name, dob, address]
-            
-        Returns:
-            Dictionary mapping each name to its list of [name, dob, address] variations
-        """
-        bt.logging.info(f"Processing {len(Response_list)} responses")
-        # Split the responses by "Respond" to get individual responses
-        Responds = "".join(Response_list).split("Respond")
-        
-        # Create a dictionary to store each name and its structured variations
-        name_variations = {}
-        
-        # Process each response to extract variations
-        for i in range(1, len(Responds)):
-            try:
-                # Process the response to extract the name and variations
-                # Returns: (seed_name, processing_method, variations_list)
-                llm_respond = self.Process_function(Responds[i], False)
-                
-                # Extract the seed name and variations
-                name = llm_respond[0]
-                
-                # Find the corresponding identity in the identity list
-                matching_identity = None
-                for identity in identity_list:
-                    if len(identity) > 0 and identity[0] == name:
-                        matching_identity = identity
-                        break
-                
-                if matching_identity is None:
-                    bt.logging.warning(f"Could not find identity for name {name}")
-                    continue
-                
-                # Get corresponding address and DOB
-                seed_address = matching_identity[2] if len(matching_identity) > 2 else "Unknown"
-                seed_dob = matching_identity[1] if len(matching_identity) > 1 else "Unknown"
-                
-                # Filter out empty or NaN variations
-                variations = [var for var in llm_respond[2] if not pd.isna(var) and var != ""]
-                
-                # Clean each variation and create structured entries
-                structured_variations = []
-                for var in variations:
-                    # Remove unwanted characters
-                    cleaned_var = var.replace(")", "").replace("(", "").replace("]", "").replace("[", "").replace(",", "")
-                    # Remove leading/trailing whitespace
-                    cleaned_var = cleaned_var.strip()
-                    # Only add non-empty variations
-                    if cleaned_var:
-                        # Create structured variation entry: [name_variation, dob_variation, address_variation]
-                        structured_variation = [cleaned_var, seed_dob, seed_address]
-                        structured_variations.append(structured_variation)
-                
-                # Store the structured variations for this name
-                name_variations[name] = structured_variations
-                bt.logging.info(f"Processed {len(structured_variations)} variations for {name}")
-            except Exception as e:
-                bt.logging.error(f"Error processing response {i}: {e}")
-        
-        bt.logging.info(f"Generated structured variations: {name_variations}")
-        return name_variations
-    
-    def save_variations_to_json(self, name_variations: Dict[str, List[str]], run_id: int, run_dir: str) -> None:
-        """
-        Save processed variations to JSON and DataFrame for debugging and analysis.
-        
-        This function saves the processed variations in multiple formats:
-        1. A pandas DataFrame saved as a pickle file in the run-specific directory
-        2. A JSON file with the name variations in the run-specific directory
-        3. A JSON file with the model name and run ID in the main output directory
-        
-        Each file is named with the run ID to distinguish between different runs.
-        
-        Args:
-            name_variations: Dictionary mapping names to variations
-            run_id: Unique identifier for this processing run
-            run_dir: Directory to save run-specific files
-        """
-        bt.logging.info(f"=================== Name variations: {name_variations}")
-        bt.logging.info(f"=================== Run ID: {run_id}")
-        bt.logging.info(f"=================== Run directory: {run_dir}")
-        bt.logging.info("Saving variations to JSON and DataFrame")
-
-        # Find the maximum number of variations for any name
-        max_variations = max([len(vars) for vars in name_variations.values()]) if name_variations else 0
-        bt.logging.info(f"Maximum number of variations found: {max_variations}")
-        
-        # Create a DataFrame with columns for the name and each variation
-        columns = ['Name'] + [f'Var_{i+1}' for i in range(max_variations)]
-        result_df = pd.DataFrame(columns=columns)
-        
-        # Fill the DataFrame with names and their variations, padding with empty strings if needed
-        for i, (name, variations) in enumerate(name_variations.items()):
-            row_data = [name] + variations + [''] * (max_variations - len(variations))
-            result_df.loc[i] = row_data
-        
-        # Note: We no longer need to clean the data here since it's already cleaned
-        # in the process_variations function
-        
-        # Save DataFrame to pickle for backup and analysis
-        # Include run_id in the filename
-        #df_path = os.path.join(run_dir, f"variations_df_{run_id}.pkl")
-        #result_df.to_pickle(df_path)
-        
-        # Convert DataFrame to JSON format
-        json_data = {}
-        for i, row in result_df.iterrows():
-            name = row['Name']
-            # Extract non-empty variations
-            variations = [var for var in row[1:] if var != ""]
-            json_data[name] = variations
-        
-        # Save to JSON file
-        # Include run_id in the filename
-        # json_path = os.path.join(run_dir, f"variations_{run_id}.json")
-        # import json
-        # with open(json_path, 'w', encoding='utf-8') as f:
-        #     json.dump(json_data, f, indent=4)
-        # bt.logging.info(f"Saved variations to: {json_path}")
-        # bt.logging.info(f"DataFrame shape: {result_df.shape} with {max_variations} variation columns")
-    
-    def Clean_extra(self, payload: str, comma: bool, line: bool, space: bool, preserve_name_spaces: bool = False) -> str:
-        """
-        Clean the LLM output by removing unwanted characters.
-        
-        Args:
-            payload: The text to clean
-            comma: Whether to remove commas
-            line: Whether to remove newlines
-            space: Whether to remove spaces
-            preserve_name_spaces: Whether to preserve spaces between names (for multi-part names)
-        """
-        # Remove punctuation and quotes
-        payload = payload.replace(".", "")
-        payload = payload.replace('"', "")
-        payload = payload.replace("'", "")
-        payload = payload.replace("-", "")
-        payload = payload.replace("and ", "")
-        
-        # Handle spaces based on preservation flag
-        if space:
-            if preserve_name_spaces:
-                # Replace multiple spaces with single space
-                while "  " in payload:
-                    payload = payload.replace("  ", " ")
-            else:
-                # Original behavior - remove all spaces
-                payload = payload.replace(" ", "")
-        
-        if comma:
-            payload = payload.replace(",", "")
-        if line:
-            payload = payload.replace("\\n", "")
-        
-        return payload.strip()
-
-    def validate_variation(self, name: str, seed: str, is_multipart_name: bool) -> str:
-        """
-        Helper function to validate if a variation matches the seed name structure.
-        
-        Args:
-            name: The variation to validate
-            seed: The original seed name
-            is_multipart_name: Whether the seed is a multi-part name
-            
-        Returns:
-            str: The validated and cleaned variation, or np.nan if invalid
-        """
-        name = name.strip()
-        if not name or name.isspace():
-            return np.nan
-        
-        # Handle cases with colons (e.g., "Here are variations: Name")
-        if ":" in name:
-            name = name.split(":")[-1].strip()
-        
-        # Check length reasonability (variation shouldn't be more than 2x the seed length)
-        if len(name) > 2 * len(seed):
-            return np.nan
-        
-        # Check structure consistency with seed name
-        name_parts = name.split()
-        if is_multipart_name:
-            # For multi-part seed names (e.g., "John Smith"), variations must also have multiple parts
-            if len(name_parts) < 2:
-                bt.logging.warning(f"Skipping single-part variation '{name}' for multi-part seed '{seed}'")
-                return np.nan
-        else:
-            # For single-part seed names (e.g., "John"), variations must be single part
-            if len(name_parts) > 1:
-                bt.logging.warning(f"Skipping multi-part variation '{name}' for single-part seed '{seed}'")
-                return np.nan
-            
-        return name
-
-    def Process_function(self, string: str, debug: bool) -> Tuple[str, str, List[str], Optional[str]]:
-        """
-        Process the LLM response to extract the seed name and variations.
-        
-        This function parses the LLM response to extract:
-        1. The original seed name
-        2. The list of name variations
-        
-        It handles different response formats from LLMs:
-        - Comma-separated lists (preferred format)
-        - Line-separated lists
-        - Space-separated lists with numbering
-        
-        The function ensures variations match the structure of the seed name:
-        - Single-part seed names (e.g., "John") only get single-part variations
-        - Multi-part seed names (e.g., "John Smith") only get multi-part variations
-        
-        Args:
-            string: The LLM response in the format:
-                   "---\nQuery-{name}\n---\n{response}"
-            debug: Whether to return debug information
-            
-        Returns:
-            Tuple containing:
-            - seed_name: The original name
-            - processing_method: The method used to process the response (r1, r2, or r3)
-            - variations_list: The list of extracted variations
-            - payload: (if debug=True) The processed payload
-        """
-        # Split the response by "---" to extract the query and response parts
-        splits = string.split('---')
-        
-        # Extract and analyze the seed name structure
-        seed = splits[1].split("-")[1].replace(".", "").replace(",", "").replace("'", "")
-        seed_parts = seed.split()
-        is_multipart_name = len(seed_parts) > 1
-        seed = self.Clean_extra(seed, True, True, True, preserve_name_spaces=is_multipart_name)
-        
-        bt.logging.info(f"Processing seed name: '{seed}' (multipart: {is_multipart_name})")
-        
-        # Extract the response payload
-        payload = splits[-1]
-        
-        # Case 1: Comma-separated list (preferred format)
-        if len(payload.split(",")) > 3:  # Check if we have at least 3 commas
-            # Clean the payload but keep commas for splitting
-            payload = self.Clean_extra(payload, False, True, True, preserve_name_spaces=is_multipart_name)
-            
-            # Remove numbering prefixes
-            for num in range(10):
-                payload = payload.replace(str(num), "")
-            
-            # Split by comma and process each variation
-            variations = []
-            for name in payload.split(","):
-                cleaned_var = self.validate_variation(name, seed, is_multipart_name)
-                if not pd.isna(cleaned_var):
-                    variations.append(cleaned_var)
-            
-            if debug:
-                return seed, "r1", variations, payload
-            return seed, "r1", variations
-        
-        # Case 2 & 3: Non-comma separated formats
-        else:
-            # Case 2: Line-separated list
-            len_ans = len(payload.split("\\n"))
-            if len_ans > 2:  # Multiple lines indicate line-separated format
-                # Clean the payload but preserve newlines for splitting
-                payload = self.Clean_extra(payload, True, False, True, preserve_name_spaces=is_multipart_name)
-                
-                # Remove numbering prefixes
-                for num in range(10):
-                    payload = payload.replace(str(num), "")
-                
-                # Process line-separated variations
-                variations = []
-                for name in payload.split("\\n"):
-                    cleaned_var = self.validate_variation(name, seed, is_multipart_name)
-                    if not pd.isna(cleaned_var):
-                        variations.append(cleaned_var)
-            
-                if debug:
-                    return seed, "r2", variations, payload
-                return seed, "r2", variations
-            
-            # Case 3: Space-separated list
-            else:
-                # Clean the payload but preserve spaces for multi-part names
-                payload = self.Clean_extra(payload, True, True, False, preserve_name_spaces=is_multipart_name)
-                
-                # Remove numbering prefixes
-                for num in range(10):
-                    payload = payload.replace(str(num), "")
-                
-                variations = []
-                if is_multipart_name:
-                    # For multi-part names, we need to carefully group the parts
-                    current_variation = []
-                    parts = payload.split()
-                    
-                    for part in parts:
-                        part = part.strip()
-                        if not part:
-                            continue
-                        
-                        if ":" in part:  # New variation starts after colon
-                            if current_variation:
-                                # Process completed variation
-                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
-                                if not pd.isna(cleaned_var):
-                                    variations.append(cleaned_var)
-                            current_variation = [part.split(":")[-1].strip()]
-                        else:
-                            current_variation.append(part)
-                            # Check if we have collected enough parts for a complete name
-                            if len(current_variation) == len(seed_parts):
-                                cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
-                                if not pd.isna(cleaned_var):
-                                    variations.append(cleaned_var)
-                                current_variation = []
-                
-                    # Handle any remaining parts
-                    if current_variation:
-                        cleaned_var = self.validate_variation(" ".join(current_variation), seed, is_multipart_name)
-                        if not pd.isna(cleaned_var):
-                            variations.append(cleaned_var)
-                else:
-                    # For single-part names, simple space splitting is sufficient
-                    for name in payload.split():
-                        cleaned_var = self.validate_variation(name, seed, is_multipart_name)
-                        if not pd.isna(cleaned_var):
-                            variations.append(cleaned_var)
-                
-                if debug:
-                    return seed, "r3", variations, payload
-                return seed, "r3", variations
-
     async def blacklist(
         self, synapse: IdentitySynapse
     ) -> typing.Tuple[bool, str]:
@@ -789,10 +311,28 @@ Remember: Only provide the name variations in a clean, comma-separated format.
         )
         return priority
 
+    @classmethod
+    def config(cls):
+        """
+        Returns the configuration object specific to this miner after adding relevant arguments.
+        """
+        parser = argparse.ArgumentParser()
+        bt.Wallet.add_args(parser)
+        bt.Subtensor.add_args(parser)
+        bt.logging.add_args(parser)
+        bt.Axon.add_args(parser)
+        
+        # Import and add miner-specific arguments
+        from MIID.utils.config import add_args, add_miner_args
+        add_args(cls, parser)
+        add_miner_args(cls, parser)
+        
+        return bt.Config(parser)
+
 
 # This is the main function, which runs the miner.
 if __name__ == "__main__":
     with Miner() as miner:
         while True:
-            bt.logging.info(f"----------------------------------Name Variation Miner running... {time.time()}")
+            # bt.logging.info(f"----------------------------------Name Variation Miner running... {time.time()}")
             time.sleep(30)

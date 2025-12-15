@@ -1,17 +1,18 @@
-.env
+Address
+neurons/main/real_street_names_db.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 bt_subnet_venv/
 
-# *venv/
-# .env/
-# *.venv/
-# ENV/
-# virtualenv/
-# *env*/
-# *.env
+*venv/
+.env/
+*.venv/
+ENV/
+virtualenv/
+*env*/
+*.env
 
 # Python bytecode
 __pycache__/
@@ -30,7 +31,7 @@ build/
 *.log
 
 # Local configuration
-
+.env
 .local
 
 # IDE specific files
@@ -155,7 +156,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
-
+.env
 .venv
 env/
 venv/
@@ -204,17 +205,6 @@ testing/
 #logs and results
 ~/.bittensor/
 
-# Test results and logs (may contain sensitive data)
-test_*.log
-*_test.log
-*_results.json
-test_*_output*.log
-test_*_output*.json
-miner_*.log
-*_format_test.json
-*_synapse_results.json
-*_synapse_output*.log
-
 
 # ollama
 ~/.ollama/
@@ -245,7 +235,3 @@ announcements/
 #MIID/validator/SanctionedIndividulas.json
 MIID/validator/test.txt
 unittest/
-
-# Large OSM PBF files
-geofabrik_cache/*.osm.pbf
-*.osm.pbf
